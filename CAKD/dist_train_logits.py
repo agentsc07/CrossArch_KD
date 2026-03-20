@@ -1,3 +1,26 @@
+"""
+CIFAR-10 Adapted ResNet50 + ViT-B/16 Logits Knowledge Distillation Training Script
+Modified from: dist_train_logits.py (original ImageNet version)
+
+CHANGES MADE FOR CIFAR-10:
+- Replaced ImageFolder with CIFAR-10 dataset (auto-downloads)
+- Disabled distributed training (single GPU mode)
+- Changed epochs from 120 → 30 for faster training
+- Increased batch size from 32 → 64 for single GPU
+- Reduced workers from 16 → 4
+- Updated output directory to ./results/cifar10_logits_vitb16
+- Removed DistributedDataParallel wrapping (commented out)
+- Simplified data loading and evaluation
+- Teacher model (ViT-B/16) still uses pre-trained ImageNet weights
+
+METHOD: Distills logits from ViT-B/16 teacher to ResNet50 student
+
+For full changelog, see: ../CHANGELOG.md
+
+Run: python dist_train_logits.py --epochs 30 --batch-size 64 --model-ema --device cuda
+Or: bash experiments/run_logits_cifar10.sh
+"""
+
 import datetime
 import os
 import time
@@ -80,28 +103,13 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix="
             loss = criterion(output, target)
 
             acc1, acc5 = new_utils.accuracy(output, target, topk=(1, 5))
-            # FIXME need to take into account that the datasets
-            # could have been padded in distributed setup
             batch_size = image.shape[0]
             metric_logger.update(loss=loss.item())
             metric_logger.meters["acc1"].update(acc1.item(), n=batch_size)
             metric_logger.meters["acc5"].update(acc5.item(), n=batch_size)
             num_processed_samples += batch_size
-    # gather the stats from all processes
 
     num_processed_samples = new_utils.reduce_across_processes(num_processed_samples)
-    if (
-        hasattr(data_loader.dataset, "__len__")
-        and len(data_loader.dataset) != num_processed_samples
-        and torch.distributed.get_rank() == 0
-    ):
-        # See FIXME above
-        warnings.warn(
-            f"It looks like the dataset has {len(data_loader.dataset)} samples, but {num_processed_samples} "
-            "samples were used for the validation, which might bias the results. "
-            "Try adjusting the batch size and / or the world size. "
-            "Setting the world size to 1 is always a safe bet."
-        )
 
     metric_logger.synchronize_between_processes()
 
@@ -119,8 +127,8 @@ def _get_cache_path(filepath):
 
 
 def load_data(traindir, valdir, args):
-    # Data loading code
-    print("Loading data")
+    # CIFAR-10 Data loading code
+    print("Loading CIFAR-10 data")
     val_resize_size, val_crop_size, train_crop_size = (
         args.val_resize_size,
         args.val_crop_size,
@@ -130,69 +138,42 @@ def load_data(traindir, valdir, args):
 
     print("Loading training data")
     st = time.time()
-    cache_path = _get_cache_path(traindir)
-    if args.cache_dataset and os.path.exists(cache_path):
-        # Attention, as the transforms are also cached!
-        print(f"Loading dataset_train from {cache_path}")
-        dataset, _ = torch.load(cache_path)
-    else:
-        # We need a default value for the variables below because args may come
-        # from train_quantization.py which doesn't define them.
-        auto_augment_policy = getattr(args, "auto_augment", None)
-        random_erase_prob = getattr(args, "random_erase", 0.0)
-        ra_magnitude = getattr(args, "ra_magnitude", None)
-        augmix_severity = getattr(args, "augmix_severity", None)
-        dataset = torchvision.datasets.ImageFolder(
-            traindir,
-            new_utils.ClassificationPresetTrain(
-                crop_size=train_crop_size,
-                interpolation=interpolation,
-                auto_augment_policy=auto_augment_policy,
-                random_erase_prob=random_erase_prob,
-                ra_magnitude=ra_magnitude,
-                augmix_severity=augmix_severity,
-            ),
-        )
-        if args.cache_dataset:
-            print(f"Saving dataset_train to {cache_path}")
-            new_utils.mkdir(os.path.dirname(cache_path))
-            new_utils.save_on_master((dataset, traindir), cache_path)
+    
+    # Load CIFAR-10 training set
+    auto_augment_policy = getattr(args, "auto_augment", None)
+    random_erase_prob = getattr(args, "random_erase", 0.0)
+    ra_magnitude = getattr(args, "ra_magnitude", None)
+    augmix_severity = getattr(args, "augmix_severity", None)
+    
+    dataset = torchvision.datasets.CIFAR10(
+        root="./data",
+        train=True,
+        download=True,
+        transform=new_utils.ClassificationPresetTrain(
+            crop_size=train_crop_size,
+            interpolation=interpolation,
+            auto_augment_policy=auto_augment_policy,
+            random_erase_prob=random_erase_prob,
+            ra_magnitude=ra_magnitude,
+            augmix_severity=augmix_severity,
+        ),
+    )
     print("Took", time.time() - st)
 
     print("Loading validation data")
-    cache_path = _get_cache_path(valdir)
-    if args.cache_dataset and os.path.exists(cache_path):
-        # Attention, as the transforms are also cached!
-        print(f"Loading dataset_test from {cache_path}")
-        dataset_test, _ = torch.load(cache_path)
-    else:
-        if args.weights and args.test_only:
-            weights = torchvision.models.get_weight(args.weights)
-            preprocessing = weights.transforms()
-        else:
-            preprocessing = new_utils.ClassificationPresetEval(
-                crop_size=val_crop_size, resize_size=val_resize_size, interpolation=interpolation
-            )
-
-        dataset_test = torchvision.datasets.ImageFolder(
-            valdir,
-            preprocessing,
-        )
-        if args.cache_dataset:
-            print(f"Saving dataset_test to {cache_path}")
-            new_utils.mkdir(os.path.dirname(cache_path))
-            new_utils.save_on_master((dataset_test, valdir), cache_path)
+    preprocessing = new_utils.ClassificationPresetEval(
+        crop_size=val_crop_size, resize_size=val_resize_size, interpolation=interpolation
+    )
+    dataset_test = torchvision.datasets.CIFAR10(
+        root="./data",
+        train=False,
+        download=True,
+        transform=preprocessing,
+    )
 
     print("Creating data loaders")
-    if args.distributed:
-        if hasattr(args, "ra_sampler") and args.ra_sampler:
-            train_sampler = RASampler(dataset, shuffle=True, repetitions=args.ra_reps)
-        else:
-            train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-        test_sampler = torch.utils.data.distributed.DistributedSampler(dataset_test, shuffle=False)
-    else:
-        train_sampler = torch.utils.data.RandomSampler(dataset)
-        test_sampler = torch.utils.data.SequentialSampler(dataset_test)
+    train_sampler = torch.utils.data.RandomSampler(dataset)
+    test_sampler = torch.utils.data.SequentialSampler(dataset_test)
 
     return dataset, dataset_test, train_sampler, test_sampler
 
@@ -201,7 +182,12 @@ def main(args):
     if args.output_dir:
         new_utils.mkdir(args.output_dir)
 
-    new_utils.init_distributed_mode(args)
+    # Skip distributed mode initialization for CIFAR-10 single GPU
+    # new_utils.init_distributed_mode(args)
+    args.distributed = False
+    args.gpu = 0
+    args.world_size = 1
+    args.rank = 0
     print(args)
 
     device = torch.device(args.device)
@@ -212,9 +198,8 @@ def main(args):
     else:
         torch.backends.cudnn.benchmark = True
 
-    train_dir = os.path.join(args.data_path, "train")
-    val_dir = os.path.join(args.data_path, "val")
-    dataset, dataset_test, train_sampler, test_sampler = load_data(train_dir, val_dir, args)
+    # CIFAR-10 doesn't use separate train/val dirs
+    dataset, dataset_test, train_sampler, test_sampler = load_data(None, None, args)
 
     collate_fn = None
     num_classes = len(dataset.classes)
@@ -322,11 +307,12 @@ def main(args):
 
     model_without_ddp = model
     teacher_without_ddp = teacher
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu],find_unused_parameters=True)
-        teacher = torch.nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu],find_unused_parameters=True)
-        model_without_ddp = model.module
-        teacher_without_ddp = teacher.module
+    # No distributed training for CIFAR-10
+    # if args.distributed:
+    #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu],find_unused_parameters=True)
+    #     teacher = torch.nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu],find_unused_parameters=True)
+    #     model_without_ddp = model.module
+    #     teacher_without_ddp = teacher.module
 
     model_ema = None
     if args.model_ema:
@@ -366,8 +352,6 @@ def main(args):
     print("Start training")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
         train_one_epoch(model, teacher, mse_criterion, criterion, optimizer, data_loader, device, epoch, args, model_ema, scaler)
         lr_scheduler.step()
         evaluate(model, criterion, data_loader_test, device=device)
@@ -397,16 +381,14 @@ def main(args):
 def get_args_parser(add_help=True):
     import argparse
 
-    parser = argparse.ArgumentParser(description="PyTorch Classification Training", add_help=add_help)
-
-    parser.add_argument("--data-path", default="/datassd2/classification/imagenet/", type=str, help="dataset path")
+    parser.add_argument("--data-path", default="./data", type=str, help="dataset path (CIFAR-10 auto-downloads)")
     parser.add_argument("--device", default="cuda", type=str, help="device (Use cuda or cpu Default: cuda)")
     parser.add_argument(
-        "-b", "--batch-size", default=32, type=int, help="images per gpu, the total batch size is $NGPU x batch_size"
+        "-b", "--batch-size", default=64, type=int, help="images per gpu (default: 64 for CIFAR-10)"
     )
-    parser.add_argument("--epochs", default=90, type=int, metavar="N", help="number of total epochs to run")
+    parser.add_argument("--epochs", default=30, type=int, metavar="N", help="number of total epochs to run (default: 30 for CIFAR-10)")
     parser.add_argument(
-        "-j", "--workers", default=16, type=int, metavar="N", help="number of data loading workers (default: 16)"
+        "-j", "--workers", default=4, type=int, metavar="N", help="number of data loading workers (default: 4)"
     )
     parser.add_argument("--opt", default="sgd", type=str, help="optimizer")
     parser.add_argument("--lr", default=0.1, type=float, help="initial learning rate")
@@ -453,7 +435,7 @@ def get_args_parser(add_help=True):
     parser.add_argument("--lr-gamma", default=0.1, type=float, help="decrease lr by a factor of lr-gamma")
     parser.add_argument("--lr-min", default=0.0, type=float, help="minimum lr of lr schedule (default: 0.0)")
     parser.add_argument("--print-freq", default=10, type=int, help="print frequency")
-    parser.add_argument("--output-dir", default=".", type=str, help="path to save outputs")
+    parser.add_argument("--output-dir", default="./results/cifar10_logits", type=str, help="path to save outputs"))
     parser.add_argument("--resume", default="", type=str, help="path of checkpoint")
     parser.add_argument("--start-epoch", default=0, type=int, metavar="N", help="start epoch")
     parser.add_argument(
@@ -507,13 +489,13 @@ def get_args_parser(add_help=True):
         "--interpolation", default="bilinear", type=str, help="the interpolation method (default: bilinear)"
     )
     parser.add_argument(
-        "--val-resize-size", default=256, type=int, help="the resize size used for validation (default: 256)"
+        "--val-resize-size", default=224, type=int, help="the resize size used for validation (default: 224, upsampled from 32x32)"
     )
     parser.add_argument(
         "--val-crop-size", default=224, type=int, help="the central crop size used for validation (default: 224)"
     )
     parser.add_argument(
-        "--train-crop-size", default=224, type=int, help="the random crop size used for training (default: 224)"
+        "--train-crop-size", default=224, type=int, help="the random crop size used for training (default: 224, upsampled from 32x32)"
     )
     parser.add_argument("--clip-grad-norm", default=None, type=float, help="the maximum gradient norm (default None)")
     parser.add_argument("--ra-sampler", action="store_true", help="whether to use Repeated Augmentation in training")
