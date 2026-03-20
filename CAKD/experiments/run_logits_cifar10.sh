@@ -24,7 +24,7 @@
 python dist_train_logits.py \
   --batch-size 64 \
   --lr 0.1 \
-  --epochs 30 \
+  --epochs 1 \
   --label-smoothing 0.1 \
   --train-crop-size 224 \
   --val-resize-size 224 \

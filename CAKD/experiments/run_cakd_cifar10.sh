@@ -27,7 +27,7 @@
 python dist_train_cakd.py \
   --batch-size 64 \
   --lr 0.1 \
-  --epochs 30 \
+  --epochs 1 \
   --auto-augment ta_wide \
   --random-erase 0.1 \
   --mixup-alpha 0.2 \
